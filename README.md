@@ -1,1 +1,1 @@
-Before you use this compressor, make sure you have ffmpeg install via homebrew.
+Before you use this compressor, make sure you have ffmpeg installed via homebrew.
