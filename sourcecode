@@ -1,0 +1,319 @@
+import Foundation
+import SwiftUI
+import UniformTypeIdentifiers
+
+class VideoCompressor {
+    
+    static func start(
+        inputURL: URL,
+        targetSizeMB: Double,
+        codecName: String,
+        selectedCodecRaw: String,
+        onStatusChange: @escaping (String) -> Void,
+        onProgressChange: @escaping (Double) -> Void,
+        onCompletion: @escaping () -> Void
+    ) {
+        onProgressChange(0.0)
+        onStatusChange("Zjišťuji délku videa...")
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ffmpegPath = "/opt/homebrew/bin/ffmpeg"
+            let ffprobePath = "/opt/homebrew/bin/ffprobe"
+            
+            let durationProcess = Process()
+            durationProcess.executableURL = URL(fileURLWithPath: ffprobePath)
+            durationProcess.arguments = ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", inputURL.path]
+            
+            let pipe = Pipe()
+            durationProcess.standardOutput = pipe
+            
+            do {
+                try durationProcess.run()
+                durationProcess.waitUntilExit()
+                
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                guard let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      let duration = Double(output) else {
+                    onStatusChange("Chyba: Nepodařilo se zjistit délku videa.")
+                    return
+                }
+                
+                let targetSizeKilobits = (targetSizeMB * 1024.0 * 8.0) * 0.97
+                let targetTotalBitrate = (targetSizeKilobits / duration)
+                let audioBitrate = 128.0
+                var videoBitrate = Int(targetTotalBitrate - audioBitrate)
+                
+                if videoBitrate < 100 { videoBitrate = 100 }
+                
+                let desktopURL = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first!
+                let outputName = "compressed_\(Int(targetSizeMB))MB_\(inputURL.deletingPathExtension().lastPathComponent).mp4"
+                let outputURL = desktopURL.appendingPathComponent(outputName)
+                
+                let tempFolderURL = URL(fileURLWithPath: NSTemporaryDirectory())
+                let codecDisplayName = selectedCodecRaw.contains("H.264") ? "H264" : "H265"
+                
+                // --- 1. průchod komprese ---
+                onStatusChange("Připravuji, analyzuji a spuštím kompresi... (\(codecDisplayName))...")
+                let pass1 = Process()
+                pass1.executableURL = URL(fileURLWithPath: ffmpegPath)
+                pass1.currentDirectoryURL = tempFolderURL
+                pass1.arguments = [
+                    "-y", "-i", inputURL.path,
+                    "-c:v", codecName, "-b:v", "\(videoBitrate)k",
+                    "-pass", "1", "-an", "-f", "null", "/dev/null"
+                ]
+                
+                observeProgress(process: pass1, totalDuration: duration, weight: 0.5, offset: 0.0, onProgressChange: onProgressChange)
+                try pass1.run()
+                pass1.waitUntilExit()
+                
+                // --- 2. průchod komprese ---
+                onStatusChange("Spouštím kompresi...")
+                let pass2 = Process()
+                pass2.executableURL = URL(fileURLWithPath: ffmpegPath)
+                pass2.currentDirectoryURL = tempFolderURL
+                pass2.arguments = [
+                    "-y", "-i", inputURL.path,
+                    "-c:v", codecName, "-b:v", "\(videoBitrate)k",
+                    "-tag:v", "hvc1",
+                    "-pass", "2", "-c:a", "aac", "-b:a", "\(Int(audioBitrate))k",
+                    outputURL.path
+                ]
+                
+                observeProgress(process: pass2, totalDuration: duration, weight: 0.5, offset: 0.5, onProgressChange: onProgressChange)
+                try pass2.run()
+                pass2.waitUntilExit()
+                
+                let fileManager = FileManager.default
+                try? fileManager.removeItem(at: tempFolderURL.appendingPathComponent("ffmpeg2pass-0.log"))
+                try? fileManager.removeItem(at: tempFolderURL.appendingPathComponent("ffmpeg2pass-0.log.mbtree"))
+                
+                onStatusChange("Hotovo! Video najdeš na ploše.")
+                onProgressChange(1.0)
+                onCompletion()
+                
+            } catch {
+                onStatusChange("Chyba při spouštění FFmpeg: \(error.localizedDescription)")
+                onCompletion()
+            }
+        }
+    }
+    
+    private static func observeProgress(process: Process, totalDuration: Double, weight: Double, offset: Double, onProgressChange: @escaping (Double) -> Void) {
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard let output = String(data: data, encoding: .utf8), !output.isEmpty else { return }
+            
+            if let range = output.range(of: "time="), let endRange = output[range.upperBound...].range(of: " ") {
+                let timeString = output[range.upperBound..<endRange.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+                
+                let components = timeString.components(separatedBy: ":")
+                if components.count == 3,
+                   let hours = Double(components[0]),
+                   let minutes = Double(components[1]),
+                   let seconds = Double(components[2]) {
+                    
+                    let currentSeconds = (hours * 3600) + (minutes * 60) + seconds
+                    let progressPercentage = currentSeconds / totalDuration
+                    
+                    let totalProgress = (progressPercentage * weight) + offset
+                    onProgressChange(totalProgress)
+                }
+            }
+        }
+    }
+}
+
+@main
+struct VideoCompressorApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+    }
+}
+
+enum VideoCodec: String, CaseIterable, Identifiable {
+    case h264 = "H.264 (Univerzální)"
+    case h265 = "H.265 (Lepší kvalita)"
+    
+    var id: String { self.rawValue }
+    
+    var ffmpegName: String {
+        switch self {
+        case .h264: return "libx264"
+        case .h265: return "libx265"
+        }
+    }
+}
+
+struct ContentView: View {
+    @State private var isTargeted = false
+    @State private var videoURL: URL? = nil
+    @State private var isCompressing = false
+    @State private var statusMessage = "Přetáhni sem video z Finderu"
+    @State private var compressionProgress: Double = 0.0
+    
+    @State private var sourceFileSizeMB: Double = Double.infinity
+    @State private var targetSizeIndex: Double = 1
+    @State private var selectedCodec: VideoCodec = .h264
+    
+    let sizeSteps: [Double] = [4, 8, 16, 32, 64, 128]
+    
+    var availableSizeSteps: [Double] {
+        let filtered = sizeSteps.filter { $0 < sourceFileSizeMB }
+        return filtered.isEmpty ? [sizeSteps[0]] : filtered
+    }
+    
+    var currentTargetSize: Double {
+        let steps = availableSizeSteps
+        let index = Int(targetSizeIndex)
+        if index < steps.count {
+            return steps[index]
+        }
+        return steps.last ?? 8.0
+    }
+    
+    var body: some View {
+        VStack(spacing: 18) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(isTargeted ? Color.blue : Color.gray.opacity(0.4), lineWidth: 2)
+                    .background(isTargeted ? Color.blue.opacity(0.05) : Color.clear)
+                    .animation(.default, value: isTargeted)
+                
+                VStack(spacing: 8) {
+                    Image(systemName: videoURL == nil ? "doc.badge.plus" : "video.fill")
+                        .font(.largeTitle)
+                        .foregroundColor(videoURL == nil ? .gray : .green)
+                    
+                    Text(videoURL?.lastPathComponent ?? "Přetáhni sem video (MP4, MOV, MKV)")
+                        .font(.body)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                }
+            }
+            .frame(height: 120)
+            .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
+                guard let provider = providers.first else { return false }
+                
+                provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { data, error in
+                    if let data = data, let pathString = String(data: data, encoding: .utf8), let url = URL(string: pathString) {
+                        DispatchQueue.main.async {
+                            let ext = url.pathExtension.lowercased()
+                            if ["mp4", "mov", "mkv", "avi", "webm"].contains(ext) {
+                                self.videoURL = url
+                                self.compressionProgress = 0.0
+                                
+                                if let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                                   let fileSize = attributes[.size] as? UInt64 {
+                                    let sizeInMB = Double(fileSize) / (1024.0 * 1024.0)
+                                    self.sourceFileSizeMB = sizeInMB
+                                    self.statusMessage = String(format: "Video připraveno (Původní: %.1f MB)", sizeInMB)
+                                } else {
+                                    self.sourceFileSizeMB = Double.infinity
+                                    self.statusMessage = "Video připraveno"
+                                }
+                                self.targetSizeIndex = 0
+                            } else {
+                                self.statusMessage = "Chyba: Podporovány jsou jen video soubory."
+                            }
+                        }
+                    }
+                }
+                return true
+            }
+            
+            VStack(spacing: 12) {
+                VStack(spacing: 4) {
+                    HStack {
+                        Text("Cílová velikost:")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("\(Int(currentTargetSize)) MB")
+                            .font(.headline)
+                            .foregroundColor(.blue)
+                    }
+                    Slider(value: $targetSizeIndex, in: 0...Double(max(0, availableSizeSteps.count - 1)), step: 1)
+                        .disabled(isCompressing)
+                }
+                
+                HStack {
+                    Text("Kodek:")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                    
+                    Spacer()
+                    
+                    Picker("", selection: $selectedCodec) {
+                        ForEach(VideoCodec.allCases) { codec in
+                            Text(codec.rawValue).tag(codec)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(isCompressing)
+                }
+            }
+            .padding(.horizontal, 5)
+            
+            Divider()
+            
+            VStack(spacing: 6) {
+                Text(statusMessage)
+                    .font(.subheadline)
+                    .foregroundColor(isCompressing ? .orange : .gray)
+                    .multilineTextAlignment(.center)
+                    .frame(height: 20)
+                
+                if isCompressing {
+                    ProgressView(value: compressionProgress, total: 1.0)
+                        .progressViewStyle(.linear)
+                        .padding(.horizontal, 10)
+                }
+            }
+            .frame(height: 40)
+            
+            Button(action: runCompression) {
+                Text(isCompressing ? "Komprimuji (\(Int(compressionProgress * 100))%)" : "Compress")
+                    .bold()
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.blue)
+            .disabled(videoURL == nil || isCompressing)
+            .frame(width: 180, height: 35)
+        }
+        .padding()
+        .frame(width: 400, height: 400)
+    }
+    
+    func runCompression() {
+        guard let url = videoURL else { return }
+        isCompressing = true
+        
+        VideoCompressor.start(
+            inputURL: url,
+            targetSizeMB: currentTargetSize,
+            codecName: selectedCodec.ffmpegName,
+            selectedCodecRaw: selectedCodec.rawValue,
+            onStatusChange: { msg in
+                DispatchQueue.main.async { self.statusMessage = msg }
+            },
+            onProgressChange: { progress in
+                DispatchQueue.main.async { self.compressionProgress = progress }
+            },
+            onCompletion: {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                    self.isCompressing = false
+                    self.videoURL = nil
+                    self.compressionProgress = 0.0
+                    self.sourceFileSizeMB = Double.infinity
+                    self.statusMessage = "Přetáhni sem video z Finderu"
+                }
+            }
+        )
+    }
+}
