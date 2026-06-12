@@ -7,7 +7,7 @@ Jednoduchá a rychlá macOS aplikace napsaná v čistém **SwiftUI**, která slo
 - **Inteligentní posuvník:** Nabízí cílové velikosti (4 MB, 8 MB, 16 MB...). Nepustí vás na větší velikost, než má původní video.
 - **Podpora moderních kodeků:** Možnost volby mezi univerzálním **H.264** a úspornějším **H.265 (HEVC)**.
 - **Apple kompatibilita:** Videa v H.265 obsahují správný tag `hvc1`, takže jdou bez problému přehrát ve Finderu i QuickTime Playeru.
-- **Reálný Progress Bar:** Dvoufázový ukazatel průběhu (2-pass encoding) parsuje data přímo z FFmpegu a ukazuje přesný stav v procentech.
+- **Reálný Progress Bar:** Dvoufázový ukazatel průběhu (2-pass encoding) tahá data přímo z FFmpegu a ukazuje přesný stav v procentech.
 
 ---
 
